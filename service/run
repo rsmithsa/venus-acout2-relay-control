@@ -1,0 +1,3 @@
+#!/bin/sh
+exec 2>&1
+exec /home/root/venus-acout2-relay-control/venus-acout2-relay-control.py
