@@ -22,6 +22,7 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), './ext/velib_python')
 from dbusmonitor import DbusMonitor
 
 from statemachine import StateMachine, State
+import statsd
 
 logger = logging.getLogger("venus-acout2-relay-control")
 
@@ -42,6 +43,7 @@ class ACOut2OverrideSettings(NamedTuple):
 class ACOut2OverrideParameters(NamedTuple):
     SOC: float
     DCPower: float
+    ACSource: int
 
 class ACOut2Override(StateMachine):
 
@@ -49,7 +51,7 @@ class ACOut2Override(StateMachine):
         self._settings = settings
         self.relayCallback = relayCallback
 
-        self._currentParameters = ACOut2OverrideParameters(0, 0)
+        self._currentParameters = ACOut2OverrideParameters(0, 0, 1)
         self._dcPowerBuffer = collections.deque([-99999.9] * self._settings.DCPowerPeriodCount, maxlen=self._settings.DCPowerPeriodCount)
 
         # Ensure we are off to start
@@ -91,6 +93,10 @@ class ACOut2Override(StateMachine):
             else:
                 return self._currentParameters.SOC > self._settings.MinSOC
         else:
+            # No AC-In, don't turn on if we weren't on already
+            if self._currentParameters.ACSource == 240:
+                return False
+            
             # apply histeresis
             if (mean(self._dcPowerBuffer) > (self._settings.MaxDCPower + self._settings.DCPowerHisteresis)
                 and self._currentParameters.SOC > (self._settings.MaxDCPowerSOC + self._settings.SOCHisteresis)):
@@ -124,27 +130,34 @@ class ACOut2Override(StateMachine):
 
 def dbus_value_change(override: ACOut2Override, dbusServiceName, dbusPath, options, changes, deviceInstance):
     if dbusPath == "/Dc/Battery/Soc":
-        override.update_parameters(ACOut2OverrideParameters(changes["Value"], override.currentParameters.DCPower))
+        override.update_parameters(ACOut2OverrideParameters(changes["Value"], override.currentParameters.DCPower, override.currentParameters.ACSource))
     elif dbusPath == "/Dc/Battery/Power":
-        override.update_parameters(ACOut2OverrideParameters(override.currentParameters.SOC, changes["Value"]))
+        override.update_parameters(ACOut2OverrideParameters(override.currentParameters.SOC, changes["Value"], override.currentParameters.ACSource))
+    elif dbusPath == "/Ac/ActiveIn/Source":
+        statsd.gauge("loadshedding", 1 if changes["Value"] == 240 else 0)
+        override.update_parameters(ACOut2OverrideParameters(override.currentParameters.SOC, override.currentParameters.DCPower, changes["Value"]))
 
 def set_venus_relay(monitor: DbusMonitor, closed: bool):
+    statsd.gauge("relay_state", 1 if closed else 0)
     monitor.set_value("com.victronenergy.system", "/Relay/0/State", 1 if closed else 0)
 
 def main():
     logging.basicConfig(level=logging.INFO)
     logger.info("venus-acout2-relay-control - Starting")
 
+    statsd.init_statsd({"STATSD_HOST": "192.168.11.11", "STATSD_BUCKET_PREFIX": "venus-acout2-relay-control"})
+    
     DBusGMainLoop(set_as_default=True)
 
-    monitor = DbusMonitor({"com.victronenergy.system": { "/Relay/0/State": None, "/Dc/Battery/Soc": None, "/Dc/Battery/Power": None }})
-    override = ACOut2Override(ACOut2OverrideSettings(0, 55, 30, 80, 3, 1000), lambda closed: set_venus_relay(monitor, closed))
+    monitor = DbusMonitor({"com.victronenergy.system": { "/Relay/0/State": None, "/Dc/Battery/Soc": None, "/Dc/Battery/Power": None, "/Ac/ActiveIn/Source": None }})
+    override = ACOut2Override(ACOut2OverrideSettings(-250, 50, 180, 60, 3, 1000), lambda closed: set_venus_relay(monitor, closed))
 
     monitor.valueChangedCallback = lambda dbusServiceName, dbusPath, options, changes, deviceInstance: dbus_value_change(override, dbusServiceName, dbusPath, options, changes, deviceInstance)
     initialSOC = monitor.get_value("com.victronenergy.system", "/Dc/Battery/Soc", 0.0)
     initialDCPower = monitor.get_value("com.victronenergy.system", "/Dc/Battery/Power", 0.0)
+    initialACSource = monitor.get_value("com.victronenergy.system", "/Ac/ActiveIn/Source", 0)
 
-    override.update_parameters(ACOut2OverrideParameters(initialSOC, initialDCPower))
+    override.update_parameters(ACOut2OverrideParameters(initialSOC, initialDCPower, initialACSource))
 
     mainloop = GLib.MainLoop()
     
