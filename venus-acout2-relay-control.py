@@ -47,16 +47,20 @@ class ACOut2OverrideParameters(NamedTuple):
 
 class ACOut2Override(StateMachine):
 
-    def __init__(self, settings: ACOut2OverrideSettings, relayCallback = lambda closed: None):
+    def __init__(self, settings: ACOut2OverrideSettings, initialRelayState: bool, relayCallback = lambda closed: None):
         self._settings = settings
         self.relayCallback = relayCallback
 
         self._currentParameters = ACOut2OverrideParameters(0, 0, 1)
         self._dcPowerBuffer = collections.deque([-99999.9] * self._settings.DCPowerPeriodCount, maxlen=self._settings.DCPowerPeriodCount)
 
-        # Ensure we are off to start
-        self.toggle_relay(False)
+        self._initialRelayState = initialRelayState
+        # Ensure we match the current relay state when we start
+        self.toggle_relay(self._initialRelayState)
+
         super().__init__()
+        # Ensure we match the current relay state when we start
+        self.current_state = self.onState if initialRelayState else self.offState
 
     @property
     def currentParameters(self):
@@ -150,7 +154,9 @@ def main():
     DBusGMainLoop(set_as_default=True)
 
     monitor = DbusMonitor({"com.victronenergy.system": { "/Relay/0/State": None, "/Dc/Battery/Soc": None, "/Dc/Battery/Power": None, "/Ac/ActiveIn/Source": None }})
-    override = ACOut2Override(ACOut2OverrideSettings(-250, 50, 180, 60, 3, 1000), lambda closed: set_venus_relay(monitor, closed))
+    initialRelayState = monitor.get_value("com.victronenergy.system", "/Relay/0/State", 0) == 1
+
+    override = ACOut2Override(ACOut2OverrideSettings(-250, 50, 180, 60, 3, 1000), initialRelayState, lambda closed: set_venus_relay(monitor, closed))
 
     monitor.valueChangedCallback = lambda dbusServiceName, dbusPath, options, changes, deviceInstance: dbus_value_change(override, dbusServiceName, dbusPath, options, changes, deviceInstance)
     initialSOC = monitor.get_value("com.victronenergy.system", "/Dc/Battery/Soc", 0.0)
